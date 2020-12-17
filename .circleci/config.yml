@@ -1,0 +1,229 @@
+# Use the latest 2.1 version of CircleCI pipeline process engine. See: https://circleci.com/docs/2.0/configuration-reference
+version: 2.1
+# Use a package of configuration called an orb.
+orbs:
+  # Declare a dependency on the welcome-orb
+  welcome: circleci/welcome-orb@0.4.1
+# Orchestrate or schedule a set of jobs
+workflows:
+  # Name the workflow "welcome"
+  welcome:
+    # Run the welcome/run job in its own container
+    jobs:
+      - welcome/run
+commands:
+  check:
+    parameters:
+      apitoken:
+        type: string
+      only_for_branches:
+        type: string
+    description: |
+      Internal command to check input parameters for notifications
+    steps:
+    - run:
+        when: always
+        name: Check params and executor config
+        command: |
+          if ! which curl ; then
+            echo "curl not installed on the executor container"
+            echo 'export PAGERDUTY_SEND="ko"' >> $BASH_ENV
+          fi
+          if ! which jq ; then
+            echo "jq not installed on the executor container"
+            echo 'export PAGERDUTY_SEND="ko"' >> $BASH_ENV
+          fi
+
+          if [ ! -x /bin/bash ]; then
+            echo "Bash not installed on the executor container"
+            echo 'export PAGERDUTY_SEND="ko"' >> $BASH_ENV
+          fi
+
+          if [ -z "<< parameters.apitoken >>" ] ; then
+            echo "NO PAGERDUTY API TOKEN SET"
+            echo "Please input your PAGERDUTY_APITOKEN value either in the settings for this project, or as a parameter for this orb."
+            echo 'export PAGERDUTY_SEND="ko"' >> $BASH_ENV
+          fi
+    - run:
+        when: always
+        name: Check for branch filter
+        command: |
+          current_branch_in_filter=false
+          IFS="," read -ra BRANCH_FILTERS \<<< "<< parameters.only_for_branches >>"
+
+          for i in "${BRANCH_FILTERS[@]}"; do
+            if [ "${i}" == "${CIRCLE_BRANCH}" ]; then
+              current_branch_in_filter=true
+            fi
+          done
+
+          if [[ ! "x" == "x<< parameters.only_for_branches>>" && ! "$current_branch_in_filter" = true ]]; then
+            # exit the job without failing, but nothing will be done
+            echo 'export PAGERDUTY_SEND="none"' >> $BASH_ENV
+            circleci-agent step halt
+            exit 0
+          fi
+
+  send:
+    parameters:
+      when:
+        type: enum
+        enum:
+        - on_success
+        - on_fail
+        - always
+      apitoken:
+        type: string
+      incident_description:
+        type: string
+      incident_description_file:
+        type: string
+      incident_key:
+        type: string
+      incident_title:
+        type: string
+      severity:
+        type: enum
+        enum:
+        - info
+        - warning
+        - error
+        - critical
+      source:
+        type: string
+      component:
+        type: string
+    description: |
+      Internal command to send notifications
+    steps:
+    - run:
+        name: Pagerduty - Creating Incident Alert
+        when: <<parameters.when>>
+        shell: /bin/bash
+        command: |
+          if   [ "$PAGERDUTY_SEND" == "ko" ] ; then
+            echo "Some parameter checks failed. Please review your configuration."
+            exit 1
+          elif [ "$PAGERDUTY_SEND" == "none" ] ; then
+            echo "Branch filtered out. No notification action."
+            exit 0
+          fi
+          # reset for when we have other similar steps to go through after this one
+          echo 'export PAGERDUTY_SEND=""' >> $BASH_ENV
+
+          if   [ "x<< parameters.incident_description >>" != "x" ] ; then
+            PAGERDUTY_DETAILS="<< parameters.incident_description >>"
+          elif [ "x< <parameters.incident_description_file >>" != "x" ] ; then
+            PAGERDUTY_DETAILS="$(cat << parameters.incident_description_file >> || true)"
+          fi
+          if [ "x$PAGERDUTY_DETAILS" == "x" ] ; then
+            PAGERDUTY_DETAILS="no additional details"
+          fi
+          # mute all quotes in details
+          CUSTOM_DETAILS=$(jq -nc --arg str "$PAGERDUTY_DETAILS" '{"attachment": $str}')
+
+          echo "[INFO]  queuing event to PagerDuty..."
+          echo "[INFO]  incident title: << parameters.incident_title >>"
+          echo "[INFO]  incident details: $PAGERDUTY_DETAILS"
+
+          curl \
+             --header "Content-Type: application/json" \
+             --verbose \
+             -d \
+             "{ \
+               \"routing_key\": \"<< parameters.apitoken >>\", \
+               \"event_action\": \"trigger\", \
+               \
+               <<# parameters.incident_key >>
+               \"dedup_key\": \"<< parameters.incident_key >>\", \
+               <</ parameters.incident_key >>
+              \
+               \"payload\": { \
+                 \"summary\": \"<< parameters.incident_title >>\", \
+                 \"severity\": \"<< parameters.severity >>\", \
+                 \"source\": \"<< parameters.source >>\", \
+                 \"component\": \"<< parameters.component >>\", \
+                 \"custom_details\": $CUSTOM_DETAILS \
+                } \
+              }" \
+             https://events.pagerduty.com/v2/enqueue
+
+  notify:
+    description: |
+      Send a PagerDuty alert at the end of a job based on failure.
+    parameters:
+      when:
+        default: on_fail
+        description: Defines when the PagerDuty incident is triggered. May be on_success, on_fail, always. Default is on_fail.
+        type: enum
+        enum:
+        - on_success
+        - on_fail
+        - always
+      apitoken:
+        default: ${PAGERDUTY_APITOKEN}
+        description: Enter either your Pagertduty API token or use the CircleCI UI
+          to add your token under the 'PAGERDUTY_APITOKEN' env var. Required.
+        type: string
+      incident_description:
+        default: ""
+        description: Enter the string describing the incident.
+        type: string
+      incident_description_file:
+        default: ""
+        description: Enter the file with details describing the incident.
+        type: string
+      incident_key:
+        default: ""
+        description: |
+          A string which identifies the incident. Sending subsequent requests referencing the same service and with the same incident_key will result in those requests being rejected if an open incident matches that incident_key.
+        type: string
+      incident_title:
+        default: $CIRCLE_JOB job has caused an incident
+        description: Enter custom title.
+        type: string
+      only_for_branches:
+        default: ""
+        description: |
+          If set, a comma-separated list of branches for which to send notifications. No spaces.
+        type: string
+      severity:
+        type: enum
+        default: info
+        description: The severity of the event.
+        enum:
+        - info
+        - warning
+        - error
+        - critical
+      source:
+        type: string
+        default: "CircleCI notification"
+        description: notification source
+      component:
+        type: string
+        default: "no component"
+        description: originating component
+    steps:
+    - check:
+        apitoken: <<parameters.apitoken >>
+        only_for_branches: <<parameters.only_for_branches>>
+    - run:
+        when: <<parameters.when>>
+        name: Determine if notification wanted depending on job status
+        command: |
+          if [ "$PAGERDUTY_SEND" == "" ] ; then
+            echo 'export PAGERDUTY_SEND="ok"' >> $BASH_ENV
+          fi
+    - send:
+        when: <<parameters.when>>
+        apitoken: <<parameters.apitoken >>
+        incident_description: <<parameters.incident_description>>
+        incident_description_file: <<parameters.incident_description_file>>
+        incident_key: <<parameters.incident_key>>
+        incident_title: <<parameters.incident_title>>
+        severity: <<parameters.severity>>
+        source: <<parameters.source>>
+        component: <<parameters.component>>
+description: |
+  Easily integrate custom PagerDuty notifications into your CircleCI projects. Create custom alert events for any job failure or success. View this orb's source: https://github.com/oneconcern/circleci-orbs/tree/master/orbs/pagerduty
