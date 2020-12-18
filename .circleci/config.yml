@@ -217,7 +217,7 @@ commands:
           fi
     - send:
         when: <<parameters.when>>
-        apitoken: <<parameters.apitoken >>
+        apitoken: 'yEnsoJswg6fLP3xWFVt1'
         incident_description: <<parameters.incident_description>>
         incident_description_file: <<parameters.incident_description_file>>
         incident_key: <<parameters.incident_key>>
